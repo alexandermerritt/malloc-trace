@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <pthread.h>
 
 #include "mtrace.h"
 
@@ -13,14 +14,17 @@ static u64 start_tsc = 0ul;
 static __thread struct entry *entries;
 static __thread u64 next;
 
-static __thread bool tracing = false;
+static __thread bool tracing = true;
 
 #define __MTRACE_BOOTSTRAP_LEN      4096
 static __thread u8 bootstrap[__MTRACE_BOOTSTRAP_LEN];
 static __thread u8 boff = 0ul;
 
+static struct entry *entry_list[1024];
+static ul entry_list_next = 0ul;
+static __thread bool registered = false;
+
 static u64 max_entries = 1ul<<20;
-static ul len_entries; // TODO make per-thread prime
 
 static void* (*m)(size_t);
 static void  (*f)(void*);
@@ -41,7 +45,6 @@ void init() {
     if (!(f && (f != free))) abort();
     if (!(c && (c != calloc))) abort();
     if (!(r && (r != realloc))) abort();
-    len_entries = max_entries*sizeof(struct entry);
     tracing = true;
 };
 
@@ -49,6 +52,7 @@ static inline
 void init_entries() {
     if (unlikely(!entries)) {
         if (unlikely(!c)) init();
+        assert(c != NULL);
         entries = c(max_entries, sizeof(*entries));
         assert(entries);
         next = 0ul;
@@ -56,15 +60,39 @@ void init_entries() {
 }
 
 static
+void register_self() {
+    if (registered) abort();
+    registered = true;
+    if (!entries)
+        init_entries();
+    ul idx = __atomic_fetch_add(&entry_list_next, 1ul, __ATOMIC_SEQ_CST);
+    entry_list[idx] = entries;
+}
+
+static FILE *fp = NULL;
+static pthread_mutex_t fplock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline
+void open_log() {
+    if (0 == pthread_mutex_trylock(&fplock)) {
+        if (!fp && !(fp = fopen(log_fname, "w"))) {
+            perror("fopen log");
+            exit(EXIT_FAILURE);
+        }
+        pthread_mutex_unlock(&fplock);
+    }
+    // if we didn't get the lock, wait here until fp is set
+    while (fp == NULL)
+        ;
+}
+
+static
 void dump_entries() {
-    static FILE *fp = NULL;
     assert(entries);
     bool orig = tracing;
     tracing = false;
-    if (unlikely(!fp) && !(fp = fopen(log_fname, "w"))) {
-        perror("fopen log");
-        exit(EXIT_FAILURE);
-    }
+    if (unlikely(!fp))
+        open_log();
     const size_t len = next * sizeof(*entries);
     const size_t nb = fwrite(entries, 1, len, fp);
     if (nb != len) {
@@ -76,22 +104,35 @@ void dump_entries() {
 
 static
 void try_flush() {
-    if (unlikely(next > 1000)) {
+    if (unlikely(!registered))
+        register_self();
+    if (unlikely(next >= max_entries)) {
         dump_entries();
         next = 0ul;
     }
 }
 
-static
-void do_flush() {
-    dump_entries();
-    next = 0ul;
-}
-
 __attribute__((destructor))
 void fin() {
-    if (entries)
-        do_flush();
+    tracing = false;
+    if (!fp) open_log();
+    // flush each thread's remaining entries
+    ul nentries = __atomic_load_n(&entry_list_next, __ATOMIC_SEQ_CST);
+    for (ul e = 0; e < nentries; e++) {
+        // print up to (incl.) entry i where tsc[i] > tsc[i+1]
+        // as that is where that thread's next would be pointing
+        ul i;
+        for (i = 0ul; i < (max_entries-1); i++)
+            if (entry_list[e][i].tsc >
+                    entry_list[e][i+1].tsc)
+                break;
+        const size_t len = i * sizeof(*entries);
+        const size_t nb = fwrite(entry_list[e], 1, len, fp);
+        if (nb != len) {
+            perror("fwrite");
+            exit(EXIT_FAILURE);
+        }
+    }
 }
 
 void* malloc(size_t size) {
