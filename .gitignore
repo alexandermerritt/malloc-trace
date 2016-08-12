@@ -1,0 +1,6 @@
+*.swp
+*.swo
+mtrace.so
+unpack
+*.o
+mtrace.log
