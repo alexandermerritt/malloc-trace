@@ -16,9 +16,9 @@ static __thread u64 next;
 
 static __thread bool tracing = true;
 
-#define __MTRACE_BOOTSTRAP_LEN      4096
+#define __MTRACE_BOOTSTRAP_LEN      (1ul<<21)
 static __thread u8 bootstrap[__MTRACE_BOOTSTRAP_LEN];
-static __thread u8 boff = 0ul;
+static __thread ul boff = 0ul;
 
 static struct entry *entry_list[1024];
 static ul entry_list_next = 0ul;
@@ -140,7 +140,7 @@ void* malloc(size_t size) {
     // us, we cannot dlsym malloc b/c ld hasn't loaded libc yet.. so
     // we bootstrap malloc with some static buffer
     if (unlikely(!m)) {
-        if (!((boff+size) < __MTRACE_BOOTSTRAP_LEN)) abort();
+        if ((boff+size) >= __MTRACE_BOOTSTRAP_LEN) abort();
         void *p = (void*)((ptrdiff_t)bootstrap + boff);
         boff += size;
         return p;
@@ -165,7 +165,7 @@ void* malloc(size_t size) {
 void free(void *ptr) {
     // avoid "freeing" buffer from static area
     if (unlikely(ptr >= (void*)bootstrap
-                && ((ptrdiff_t)ptr-(ptrdiff_t)bootstrap)
+                && ((uintptr_t)ptr-(uintptr_t)bootstrap)
                         <= __MTRACE_BOOTSTRAP_LEN))
         return;
     if (unlikely(!f)) init();
@@ -187,7 +187,7 @@ void free(void *ptr) {
 
 void* calloc(size_t nmemb, size_t size) {
     if (unlikely(!c)) {
-        if (!((boff+(nmemb*size)) < 1024)) abort();
+        if ((boff+(nmemb*size)) >= __MTRACE_BOOTSTRAP_LEN) abort();
         void *p = (void*)((ptrdiff_t)bootstrap + boff);
         boff += (nmemb*size);
         return p;
